@@ -4687,12 +4687,8 @@ NGINX_SELFSTEAL_TLS
   fi
   systemctl reload nginx >/dev/null 2>&1 || return 1
 
-  echo -e "${YELLOW}Применить SNI=$domain и dest=$SELFSTEAL_DEST ко всем Reality inbound? (y/N): ${NC}"
-  local apply_now
-  read -r apply_now
-  if [[ "$apply_now" =~ ^[yYдД]$ ]]; then
-    _selfsteal_apply_to_reality_inbounds "$domain" || return 1
-  fi
+  echo -e "${CYAN}  → Применяю обязательный self-steal ко всем Reality inbound...${NC}"
+  _selfsteal_apply_to_reality_inbounds "$domain" || return 1
 
   echo "$domain" > "$SELFSTEAL_DOMAIN_FILE"
   echo "$template" > "$SELFSTEAL_TEMPLATE_FILE"
@@ -5813,11 +5809,18 @@ _select_subscription_port() {
 }
 
 _happ_find_existing_multiroute_profile() {
-  local profile_file profile_name route_count live_count
+  local profile_file profile_name route_count live_count transport port
   for profile_file in "$PROFILES_DIR"/*.json; do
     [[ -f "$profile_file" ]] || continue
     route_count=$(jq -r '(.routes // []) | length' "$profile_file" 2>/dev/null || echo 0)
     live_count=$(_profile_live_route_count "$profile_file" 2>/dev/null || echo 0)
+    transport=$(jq -r '.transport // empty' "$profile_file" 2>/dev/null)
+    port=$(jq -r '.port // empty' "$profile_file" 2>/dev/null)
+    if [[ "$transport" == "tcp" && "$port" == "443" && "$live_count" -ge 1 ]]; then
+      profile_name=$(basename "$profile_file" .json)
+      echo "$profile_name"
+      return 0
+    fi
     if [[ "$route_count" =~ ^[0-9]+$ ]] && [[ "$live_count" =~ ^[0-9]+$ ]] && \
        [[ "$route_count" -ge 7 ]] && [[ "$live_count" -ge 7 ]]; then
       profile_name=$(basename "$profile_file" .json)
@@ -5866,9 +5869,10 @@ _happ_ensure_default_multiroute_profile() {
 
   local profile_name
   profile_name=$(_happ_next_default_profile_name)
-  echo -e "${CYAN}  → Создаю HAPP профиль '${profile_name}' с 7 маршрутами...${NC}"
-  if ! create_profile_all_routes "$profile_name" "no_pause" "hide_subscription"; then
-    echo -e "${RED}✗ Не удалось создать HAPP multi-route профиль${NC}"
+  echo -e "${CYAN}  → Создаю HAPP профиль '${profile_name}': TCP Reality Vision на 443...${NC}"
+  if ! create_profile "$profile_name" "tcp" "443" "$DEFAULT_CLIENT_FINGERPRINT" "" "" "" \
+      "skip_443_confirmation" "no_pause" "hide_subscription"; then
+    echo -e "${RED}✗ Не удалось создать HAPP профиль на 443${NC}"
     return 1
   fi
 
@@ -7427,6 +7431,9 @@ create_profile() {
   local custom_sni=$5  # Опциональный кастомный SNI
   local grpc_service_name=$6
   local xhttp_path=$7
+  local confirmation_mode=${8:-confirm_443}
+  local pause_after=${9:-pause}
+  local subscription_output=${10:-show_subscription}
   local uuid=$(uuidgen)
 
   # Phase 7 REQ-C04: sub_token (32 hex-символа) для HAPP subscription URL.
@@ -7443,8 +7450,10 @@ create_profile() {
 
   if [[ -z "$port" ]]; then
     if ! defaults=$(build_transport_defaults "$transport"); then
-      echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
-      read
+      if [[ "$pause_after" != "no_pause" ]]; then
+        echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
+        read
+      fi
       return 1
     fi
     IFS='|' read -r port generated_grpc_service_name generated_xhttp_path <<< "$defaults"
@@ -7470,7 +7479,8 @@ create_profile() {
       ;;
   esac
 
-  if [[ "$port" == "443" ]] && [[ "$transport" == "tcp" || "$transport" == "tcp-utls" || "$transport" == "tcp-xudp" ]]; then
+  if [[ "$confirmation_mode" != "skip_443_confirmation" ]] && \
+     [[ "$port" == "443" ]] && [[ "$transport" == "tcp" || "$transport" == "tcp-utls" || "$transport" == "tcp-xudp" ]]; then
     if ! confirm_vision_443_risk; then
       echo -e "${CYAN}✓ Создание профиля отменено${NC}"
       sleep 1
@@ -7523,8 +7533,10 @@ create_profile() {
     echo -e "${RED}Inbound не создан — файл профиля удалён.${NC}"
     echo -e "${YELLOW}Попробуйте другой порт или транспорт.${NC}"
     echo ""
-    echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
-    read
+    if [[ "$pause_after" != "no_pause" ]]; then
+      echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
+      read
+    fi
     return 1
   fi
 
@@ -7539,8 +7551,10 @@ create_profile() {
     echo -e "${RED}Xray не принял новую конфигурацию. Профиль удалён, config.json откатан.${NC}"
     echo -e "${YELLOW}Проверьте последний бэкап в /usr/local/etc/xray/backups/.${NC}"
     echo ""
-    echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
-    read
+    if [[ "$pause_after" != "no_pause" ]]; then
+      echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
+      read
+    fi
     return 1
   fi
 
@@ -7562,9 +7576,10 @@ create_profile() {
 
   # Phase 7: subscription URL/QR — primary output если подписка установлена.
   # B1: URL строится через _subscription_base_url (Plan 7.2 helper) — никакого инлайна!
-  if [[ -f /usr/local/etc/xray/.subscription_installed ]]; then
+  if [[ "$subscription_output" != "hide_subscription" ]] && \
+     [[ -f /usr/local/etc/xray/.subscription_installed ]]; then
     _happ_print_subscription_url_for_profile "$name"
-  else
+  elif [[ "$subscription_output" != "hide_subscription" ]]; then
     echo ""
     echo -e "${YELLOW}ℹ HAPP-подписка ещё не установлена. Включите через 'Главное меню → Подписка HAPP'.${NC}"
   fi
@@ -7573,8 +7588,10 @@ create_profile() {
   echo -e "${CYAN}Используйте меню 'Подключиться по профилю' для получения ссылки${NC}"
   echo ""
   fix_xray_permissions
-  echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
-  read
+  if [[ "$pause_after" != "no_pause" ]]; then
+    echo -n -e "${YELLOW}Нажмите Enter для продолжения...${NC}"
+    read
+  fi
 }
 
 # Добавление inbound
@@ -10903,13 +10920,12 @@ NGINXHTTPS
   echo "=== Профиль ===" >&2
 
   # Определяем порт для Xray (Xray на 443, nginx на 8443)
-  # HAPP требует multi-route профиль (schema_version 3, routes[] с 7 маршрутами,
-  # включая xhttp-legacy). _happ_ensure_default_multiroute_profile — единый источник
-  # истины: создаёт профиль при отсутствии или возвращает существующий.
-  # Создание одиночного профиля здесь ломало HAPP ("route not shown / country n/a").
-  echo "  Обеспечиваю multi-route HAPP профиль..." >&2
+  # Создаём или переиспользуем основной HAPP-профиль. Для свежей установки это
+  # одиночный TCP Reality Vision route на 443; существующий живой multi-route
+  # профиль сохраняется для обратной совместимости.
+  echo "  Обеспечиваю основной HAPP профиль..." >&2
   if ! _happ_ensure_default_multiroute_profile >/dev/null 2>&1; then
-    echo '{"ok":false,"error":"Не удалось создать HAPP multi-route профиль"}'
+    echo '{"ok":false,"error":"Не удалось создать основной HAPP профиль"}'
     _qs_nginx_rollback
     return 1
   fi
@@ -10934,7 +10950,7 @@ NGINXHTTPS
   local result_uuid result_sub_token route_count
   result_uuid=$(jq -r '.uuid' "$profile_file")
   result_sub_token=$(jq -r '.sub_token' "$profile_file")
-  route_count=$(jq -r '(.routes // []) | length' "$profile_file" 2>/dev/null || echo 0)
+  route_count=$(jq -r 'if ((.routes // []) | length) > 0 then (.routes | length) else 1 end' "$profile_file" 2>/dev/null || echo 0)
 
   # URL строим через canonical helper — без хардкода порта.
   # Если ранее был ip_tls на :443 или домен на :443, URL корректно опустит порт.
@@ -10996,10 +11012,10 @@ happ_setup_command() {
     return 1
   fi
 
-  # 2. Создать/найти multi-route профиль (7 маршрутов)
-  echo '=== HAPP multi-route профиль ===' >&2
+  # 2. Создать/найти основной HAPP-профиль на 443
+  echo '=== Основной HAPP профиль ===' >&2
   if ! _happ_ensure_default_multiroute_profile >/dev/null 2>&1; then
-    echo '{"ok":false,"error":"Не удалось создать HAPP multi-route профиль"}'
+    echo '{"ok":false,"error":"Не удалось создать основной HAPP профиль"}'
     return 1
   fi
   local _profile_name="$HAPP_DEFAULT_PROFILE"
@@ -11031,7 +11047,7 @@ happ_setup_command() {
   _base=$(_subscription_base_url)
 
   local _route_count
-  _route_count=$(jq -r '(.routes // []) | length' "$PROFILES_DIR/$_profile_name.json")
+  _route_count=$(jq -r 'if ((.routes // []) | length) > 0 then (.routes | length) else 1 end' "$PROFILES_DIR/$_profile_name.json")
 
   # «Сторона» сервера для GUI (country/city/flag) + ОС.
   local _sub_country _sub_city _sub_flag _sub_os
@@ -12586,6 +12602,10 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
       shift
       happ_setup_command "$@"
       ;;
+    selfsteal-setup)
+      shift
+      install_selfsteal_stub_menu
+      ;;
     probe-test)
       shift
       probe_test_command
@@ -12646,7 +12666,8 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
       echo -e "  ${CYAN}sudo xrayebator quickstart --email EMAIL${NC}  — авторазвёртывание: подписка+IP-TLS+HAPP profile"
       echo -e "  ${CYAN}sudo xrayebator quickstart --without-email${NC}  — то же, но ACME-регистрация без email (без уведомлений)"
       echo -e "  ${CYAN}sudo xrayebator inspect --json${NC}          — read-only диагностика установки (для GUI-импорта)"
-      echo -e "  ${CYAN}sudo xrayebator happ-setup${NC}       — создать/переиспользовать HAPP multi-route профиль"
+      echo -e "  ${CYAN}sudo xrayebator happ-setup${NC}       — создать/переиспользовать основной HAPP-профиль"
+      echo -e "  ${CYAN}sudo xrayebator selfsteal-setup${NC}  — интерактивно настроить домен и обязательный self-steal"
       echo -e "  ${CYAN}sudo xrayebator probe-test${NC}       — проверить доступность SNI с VPS"
       echo -e "  ${CYAN}sudo xrayebator profiles${NC}          — JSON-список профилей"
       echo -e "  ${CYAN}sudo xrayebator profile-create --name N [--transport T] [--port P] [--count N] [--expire 2006-12-31]${NC}"

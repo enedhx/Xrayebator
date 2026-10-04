@@ -1079,7 +1079,7 @@ UFW_ERRORS=0
 # Xrayebator (иначе uninstall удалил бы чужое правило на 443/8443). Если правило
 # уже существовало ДО нас — не трогаем и не регистрируем.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-for ufw_port in 22 80 443 8443 2053 2083 2087 8080 2096 8880 9443; do
+for ufw_port in 80 443; do
   if _ufw_rule_exists "$ufw_port" tcp; then
     continue  # уже открыто кем-то до нас — чужие правила не присваиваем
   fi
@@ -1100,7 +1100,7 @@ if [[ $UFW_ERRORS -eq 0 ]]; then
 else
   echo -e "${YELLOW}⚠ Firewall настроен с ошибками ($UFW_ERRORS портов не открылись)${NC}"
 fi
-echo -e "${CYAN}  Открытые порты: 443, 2053, 2083, 2087, 2096, 8080, 8443, 8880, 9443${NC}\n"
+echo -e "${CYAN}  Открытые порты: SSH (${sfw_ssh_port}), 80, 443${NC}\n"
 else
 echo -e "${YELLOW}  ⚠ UFW не включён — порты не открывались (избегаем блокировки SSH)${NC}"
 fi
