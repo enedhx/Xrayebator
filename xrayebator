@@ -4703,7 +4703,7 @@ server {
     index index.html;
     add_header X-Robots-Tag "noindex, nofollow, nosnippet" always;
 
-    location ~ ^/sub/[a-f0-9]{32}(?:/(?:geoip|geosite)\.dat)?$ {
+    location ~ "^/sub/[a-f0-9]{32}(?:/(?:geoip|geosite)\.dat)?\$" {
         access_log off;
         proxy_intercept_errors on;
         error_page 500 502 503 504 =404 @selfsteal_not_found;
