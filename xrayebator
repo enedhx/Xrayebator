@@ -1867,8 +1867,9 @@ close_firewall_port() {
     return 0  # Still in use, don't close
   fi
 
-  # Never close default ports
-  local default_ports=(22 80 443 8443 2053 2083 2087 8080 2096 8880 9443)
+  # Never close infrastructure ports. Any optional high port is retained only
+  # while a live inbound still uses it.
+  local default_ports=(22 80 443)
   for dp in "${default_ports[@]}"; do
     [[ "$port" == "$dp" ]] && return 0
   done
@@ -4542,16 +4543,44 @@ install_selfsteal_stub_menu() {
     return 1
   fi
 
-  local server_ip resolved_ip
+  local server_ip server_ips resolved_ips unexpected_ips dns_ip
   server_ip=$(get_server_ip)
-  resolved_ip=$(getent hosts "$domain" 2>/dev/null | awk '{print $1}' | head -1)
-  if [[ -n "$resolved_ip" && -n "$server_ip" && "$resolved_ip" != "$server_ip" ]]; then
-    echo -e "${YELLOW}  ⚠ DNS $domain → $resolved_ip, VPS IP = $server_ip${NC}"
-    echo -n -e "${YELLOW}Продолжить? (y/N): ${NC}"
-    local cont
-    read -r cont
-    [[ "$cont" =~ ^[yYдД]$ ]] || return 1
+  server_ips=$(
+    {
+      [[ -n "$server_ip" ]] && echo "$server_ip"
+      ip -o -6 addr show scope global 2>/dev/null |
+        awk '{split($4, address, "/"); print address[1]}'
+    } | sort -u
+  )
+  resolved_ips=$(
+    {
+      getent ahostsv4 "$domain" 2>/dev/null || true
+      getent hosts "$domain" 2>/dev/null || true
+    } | awk '{print $1}' | sort -u
+  )
+  if [[ -z "$server_ips" ]]; then
+    echo -e "${RED}✗ Не удалось определить публичные IP этой VPS${NC}"
+    return 1
   fi
+  if [[ -z "$resolved_ips" ]]; then
+    echo -e "${RED}✗ Домен $domain не разрешается через DNS${NC}"
+    return 1
+  fi
+  unexpected_ips=""
+  while IFS= read -r dns_ip; do
+    [[ -n "$dns_ip" ]] || continue
+    if ! grep -qxF "$dns_ip" <<< "$server_ips"; then
+      unexpected_ips+="${dns_ip}"$'\n'
+    fi
+  done <<< "$resolved_ips"
+  if [[ -n "$unexpected_ips" ]]; then
+    echo -e "${RED}✗ DNS домена не указывает на эту VPS${NC}"
+    echo -e "${YELLOW}  DNS $domain → $(tr '\n' ' ' <<< "$resolved_ips")${NC}"
+    echo -e "${YELLOW}  Адреса VPS → $(tr '\n' ' ' <<< "$server_ips")${NC}"
+    echo -e "${YELLOW}  Отключите CDN/proxy и направьте A/AAAA-запись прямо на VPS.${NC}"
+    return 1
+  fi
+  echo -e "${GREEN}  ✓ Все DNS-адреса $domain принадлежат этой VPS${NC}"
 
   local template
   template=$(_selfsteal_template_menu)
@@ -4673,6 +4702,27 @@ server {
     root ${stub_root};
     index index.html;
     add_header X-Robots-Tag "noindex, nofollow, nosnippet" always;
+
+    location ~ ^/sub/[a-f0-9]{32}(?:/(?:geoip|geosite)\.dat)?$ {
+        access_log off;
+        proxy_intercept_errors on;
+        error_page 500 502 503 504 =404 @selfsteal_not_found;
+        add_header Cache-Control "no-store" always;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location /sub/ {
+        return 404;
+    }
+
+    location @selfsteal_not_found {
+        return 404;
+    }
 
     location / {
         try_files \$uri /index.html;
@@ -5116,7 +5166,7 @@ update_command() {
     up_script=$(command -v xrayebator 2>/dev/null || echo /usr/local/bin/xrayebator)
     up_tmp=$(mktemp /tmp/xrayebator_update_XXXXXX)
     if curl -fsSL --connect-timeout 10 --max-time 60 \
-        "https://raw.githubusercontent.com/howdeploy/Xrayebator/${branch}/xrayebator" -o "$up_tmp" \
+        "https://raw.githubusercontent.com/enedhx/Xrayebator/${branch}/xrayebator" -o "$up_tmp" \
         && [[ -s "$up_tmp" ]] && bash -n "$up_tmp"; then
       chmod 755 "$up_tmp"
       if mv "$up_tmp" "$up_script"; then
@@ -5808,19 +5858,33 @@ _select_subscription_port() {
   return 0
 }
 
-_happ_find_existing_multiroute_profile() {
-  local profile_file profile_name route_count live_count transport port
+_happ_find_existing_primary_443_profile() {
+  local profile_file profile_name live_count transport port
   for profile_file in "$PROFILES_DIR"/*.json; do
     [[ -f "$profile_file" ]] || continue
-    route_count=$(jq -r '(.routes // []) | length' "$profile_file" 2>/dev/null || echo 0)
-    live_count=$(_profile_live_route_count "$profile_file" 2>/dev/null || echo 0)
     transport=$(jq -r '.transport // empty' "$profile_file" 2>/dev/null)
     port=$(jq -r '.port // empty' "$profile_file" 2>/dev/null)
-    if [[ "$transport" == "tcp" && "$port" == "443" && "$live_count" -ge 1 ]]; then
+    [[ "$transport" == "tcp" && "$port" == "443" ]] || continue
+    live_count=$(_profile_live_route_count "$profile_file" 2>/dev/null || echo 0)
+    if [[ "$live_count" =~ ^[0-9]+$ ]] && [[ "$live_count" -ge 1 ]]; then
       profile_name=$(basename "$profile_file" .json)
       echo "$profile_name"
       return 0
     fi
+  done
+  return 1
+}
+
+_happ_find_existing_multiroute_profile() {
+  local profile_file profile_name route_count live_count
+  if profile_name=$(_happ_find_existing_primary_443_profile); then
+    echo "$profile_name"
+    return 0
+  fi
+  for profile_file in "$PROFILES_DIR"/*.json; do
+    [[ -f "$profile_file" ]] || continue
+    route_count=$(jq -r '(.routes // []) | length' "$profile_file" 2>/dev/null || echo 0)
+    live_count=$(_profile_live_route_count "$profile_file" 2>/dev/null || echo 0)
     if [[ "$route_count" =~ ^[0-9]+$ ]] && [[ "$live_count" =~ ^[0-9]+$ ]] && \
        [[ "$route_count" -ge 7 ]] && [[ "$live_count" -ge 7 ]]; then
       profile_name=$(basename "$profile_file" .json)
@@ -11060,6 +11124,135 @@ happ_setup_command() {
   return 0
 }
 
+primary_setup_command() {
+  export TERM=dumb
+  export DEBIAN_FRONTEND=noninteractive
+  export XRAYEBATOR_NONINTERACTIVE=1
+
+  local selfsteal_domain
+  selfsteal_domain=$(_selfsteal_domain_value 2>/dev/null || true)
+  if [[ -z "$selfsteal_domain" ]]; then
+    echo '{"ok":false,"error":"Self-steal не настроен. Сначала выполните xrayebator selfsteal-setup"}'
+    return 1
+  fi
+
+  local profile_name
+  if profile_name=$(_happ_find_existing_primary_443_profile); then
+    echo "{\"ok\":true,\"profile\":\"${profile_name}\",\"transport\":\"tcp\",\"port\":443,\"reused\":true}"
+    return 0
+  fi
+
+  profile_name=$(_happ_next_default_profile_name)
+  if ! create_profile "$profile_name" "tcp" "443" "$DEFAULT_CLIENT_FINGERPRINT" \
+      "$selfsteal_domain" "" "" "skip_443_confirmation" "no_pause" "hide_subscription" >&2; then
+    echo '{"ok":false,"error":"Не удалось создать основной TCP Reality Vision профиль на 443"}'
+    return 1
+  fi
+
+  if ! _profile_route_matches_live_inbound "$PROFILES_DIR/${profile_name}.json"; then
+    echo '{"ok":false,"error":"Созданный профиль не совпадает с live inbound на 443"}'
+    return 1
+  fi
+
+  echo "{\"ok\":true,\"profile\":\"${profile_name}\",\"transport\":\"tcp\",\"port\":443,\"reused\":false}"
+  return 0
+}
+
+_subscription_selfsteal_https_self_test() {
+  local domain="$1" token="$2"
+  [[ "$domain" =~ ^[a-zA-Z0-9.-]+$ ]] || return 1
+  [[ "$token" =~ ^[a-f0-9]{32}$ ]] || return 1
+
+  local body_tmp err_tmp http_status curl_rc=0
+  body_tmp=$(mktemp /tmp/xrayebator-selfsteal-test.XXXXXX) || return 1
+  err_tmp=$(mktemp /tmp/xrayebator-selfsteal-test.err.XXXXXX) || {
+    rm -f "$body_tmp"
+    return 1
+  }
+
+  http_status=$(curl -sS --noproxy '*' \
+      --resolve "${domain}:443:127.0.0.1" \
+      --connect-timeout 3 --max-time 30 \
+      "https://${domain}/" \
+      -o "$body_tmp" -w '%{http_code}' 2>"$err_tmp") || curl_rc=$?
+  if [[ "$curl_rc" -ne 0 || "$http_status" != "200" || ! -s "$body_tmp" ]]; then
+    rm -f "$body_tmp" "$err_tmp"
+    return 1
+  fi
+
+  curl_rc=0
+  http_status=$(curl -sS --noproxy '*' \
+      --resolve "${domain}:443:127.0.0.1" \
+      --connect-timeout 3 --max-time 30 \
+      "https://${domain}/sub/${token}" \
+      -o "$body_tmp" -w '%{http_code}' 2>"$err_tmp") || curl_rc=$?
+  if [[ "$curl_rc" -ne 0 || "$http_status" != "200" ]] || ! grep -q 'vless://' "$body_tmp"; then
+    rm -f "$body_tmp" "$err_tmp"
+    return 1
+  fi
+
+  rm -f "$body_tmp" "$err_tmp"
+  return 0
+}
+
+subscription_selfsteal_setup_command() {
+  export TERM=dumb
+  export DEBIAN_FRONTEND=noninteractive
+  export XRAYEBATOR_NONINTERACTIVE=1
+
+  local selfsteal_domain
+  selfsteal_domain=$(_selfsteal_domain_value 2>/dev/null || true)
+  if [[ -z "$selfsteal_domain" ]]; then
+    echo '{"ok":false,"error":"Self-steal не настроен"}'
+    return 1
+  fi
+
+  local selfsteal_vhost="/etc/nginx/sites-available/xrayebator-selfsteal"
+  if [[ ! -f "$selfsteal_vhost" ]] || ! grep -q 'proxy_pass http://127.0.0.1:8080;' "$selfsteal_vhost"; then
+    echo '{"ok":false,"error":"Self-steal nginx ещё не содержит защищённый endpoint подписки"}'
+    return 1
+  fi
+
+  local profile_name profile_file token
+  if ! profile_name=$(_happ_find_existing_primary_443_profile); then
+    echo '{"ok":false,"error":"Основной TCP Reality Vision профиль на 443 не найден"}'
+    return 1
+  fi
+  profile_file="$PROFILES_DIR/${profile_name}.json"
+  token=$(jq -r '.sub_token // empty' "$profile_file" 2>/dev/null)
+  if [[ ! "$token" =~ ^[a-f0-9]{32}$ ]]; then
+    echo '{"ok":false,"error":"У основного профиля отсутствует корректный токен подписки"}'
+    return 1
+  fi
+
+  if ! install_subscription_server >/dev/null 2>&1; then
+    echo '{"ok":false,"error":"Не удалось установить локальный обработчик подписки"}'
+    return 1
+  fi
+
+  _subscription_write_markers "443" "$selfsteal_domain" "$selfsteal_domain" "domain_tls"
+  if ! _subscription_restart_service; then
+    echo '{"ok":false,"error":"Не удалось запустить локальный обработчик подписки"}'
+    return 1
+  fi
+  if ! _subscription_local_self_test "$token"; then
+    echo '{"ok":false,"error":"Локальный обработчик не вернул рабочую VLESS-подписку"}'
+    return 1
+  fi
+  if ! _subscription_selfsteal_https_self_test "$selfsteal_domain" "$token"; then
+    echo '{"ok":false,"error":"Self-steal HTTPS на 443 не прошёл сквозную проверку сайта и подписки"}'
+    return 1
+  fi
+
+  local base_url
+  base_url=$(_subscription_base_url)
+  jq -cn \
+    --arg profile "$profile_name" \
+    --arg url "${base_url}/sub/${token}" \
+    '{ok:true, profile:$profile, subscription_url:$url, public_port:443, local_handler:"127.0.0.1:8080"}'
+  return 0
+}
+
 # ────────────────────────────────────────────────────────────────────────────────
 # CLI для управления профилями (используется GUI «Настройки сервера»).
 # Команды переиспользуют примитивы (add_inbound, backup_config, safe_restart_xray)
@@ -12606,6 +12799,14 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
       shift
       install_selfsteal_stub_menu
       ;;
+    primary-setup)
+      shift
+      primary_setup_command
+      ;;
+    subscription-selfsteal-setup)
+      shift
+      subscription_selfsteal_setup_command
+      ;;
     probe-test)
       shift
       probe_test_command
@@ -12668,6 +12869,8 @@ if [[ "$XRAYEBATOR_SOURCED" -eq 0 ]]; then
       echo -e "  ${CYAN}sudo xrayebator inspect --json${NC}          — read-only диагностика установки (для GUI-импорта)"
       echo -e "  ${CYAN}sudo xrayebator happ-setup${NC}       — создать/переиспользовать основной HAPP-профиль"
       echo -e "  ${CYAN}sudo xrayebator selfsteal-setup${NC}  — интерактивно настроить домен и обязательный self-steal"
+      echo -e "  ${CYAN}sudo xrayebator primary-setup${NC}    — создать/переиспользовать TCP Reality Vision профиль на 443"
+      echo -e "  ${CYAN}sudo xrayebator subscription-selfsteal-setup${NC} — подписка через self-steal HTTPS на 443"
       echo -e "  ${CYAN}sudo xrayebator probe-test${NC}       — проверить доступность SNI с VPS"
       echo -e "  ${CYAN}sudo xrayebator profiles${NC}          — JSON-список профилей"
       echo -e "  ${CYAN}sudo xrayebator profile-create --name N [--transport T] [--port P] [--count N] [--expire 2006-12-31]${NC}"

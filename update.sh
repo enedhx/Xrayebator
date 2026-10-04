@@ -3,7 +3,7 @@
 # ═══════════════════════════════════════════════════════════
 # XRAYEBATOR UPDATE SCRIPT v3.0
 # Обновление Xrayebator до последней версии
-# GitHub: howdeploy — https://github.com/howdeploy/Xrayebator
+# GitHub: enedhx — https://github.com/enedhx/Xrayebator
 # ═══════════════════════════════════════════════════════════
 
 # Цвета
@@ -16,7 +16,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # GitHub репозиторий
-GITHUB_USER="howdeploy"
+GITHUB_USER="enedhx"
 GITHUB_REPO="Xrayebator"
 
 # ═══ Детекция IPv6-only VPS (shared helper) ═══
@@ -234,6 +234,11 @@ elif [[ -f "$UPDATE_SESSION_FILE" ]]; then
   echo -e "${CYAN}Восстанавливаю прерванное обновление...${NC}"
   echo -e "${BLUE}Ветка из сессии: ${MAGENTA}$GITHUB_BRANCH${NC}\n"
   sleep 1
+# Обычное обновление продолжает установленную ветку и не откатывает кастомную
+# сборку на upstream main. Меню остаётся fallback для старых установок без маркера.
+elif [[ -s /usr/local/etc/xray/.current_branch ]]; then
+  GITHUB_BRANCH=$(cat /usr/local/etc/xray/.current_branch)
+  echo -e "${BLUE}Обновление установленной ветки: ${MAGENTA}$GITHUB_BRANCH${NC}\n"
 else
   # Первый запуск - показываем меню выбора ветки
   clear
@@ -329,6 +334,10 @@ if [[ -z "$VERSION_NAME" ]]; then
     experimental)
       VERSION_NAME="Experimental"
       VERSION_COLOR="${MAGENTA}"
+      ;;
+    codex/stealth-443)
+      VERSION_NAME="Stealth 443"
+      VERSION_COLOR="${GREEN}"
       ;;
   esac
 fi

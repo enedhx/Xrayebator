@@ -1076,7 +1076,7 @@ fi
 
 UFW_ERRORS=0
 # P2-fix: регистрируем в root-owned манифесте только правила, открытые ИМЕННО
-# Xrayebator (иначе uninstall удалил бы чужое правило на 443/8443). Если правило
+# Xrayebator (иначе uninstall удалил бы чужое правило на 80/443). Если правило
 # уже существовало ДО нас — не трогаем и не регистрируем.
 if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
 for ufw_port in 80 443; do
@@ -1244,6 +1244,43 @@ else
   echo -e "${CYAN}✓ Xray установлен (запустится при создании профиля)${NC}\n"
 fi
 
+# Обязательный self-steal: интерактивно запрашивает домен, email и шаблон сайта.
+# Повторный --resume не запускает мастер заново после успешно сохранённого домена.
+if [[ -s /usr/local/etc/xray/.selfsteal_domain ]]; then
+  selfsteal_domain=$(tr -d '\r\n' < /usr/local/etc/xray/.selfsteal_domain)
+  echo -e "${GREEN}✓ Self-steal уже настроен: ${selfsteal_domain}${NC}\n"
+else
+  if [[ ! -r /dev/tty ]]; then
+    echo -e "${RED}✗ Для обязательной настройки self-steal нужен интерактивный терминал${NC}" >&2
+    echo -e "${YELLOW}Запустите установщик из SSH-сессии с доступным /dev/tty.${NC}" >&2
+    exit 1
+  fi
+  echo -e "${BLUE}Настройка обязательного self-steal...${NC}"
+  if ! /usr/local/bin/xrayebator selfsteal-setup < /dev/tty; then
+    echo -e "${RED}✗ Self-steal не настроен; установка не считается завершённой${NC}" >&2
+    exit 1
+  fi
+fi
+
+echo -e "${BLUE}Создание основного VPN-профиля на 443/tcp...${NC}"
+primary_result=$(/usr/local/bin/xrayebator primary-setup)
+if [[ "$(jq -r '.ok // false' <<< "$primary_result" 2>/dev/null)" != "true" ]]; then
+  primary_error=$(jq -r '.error // "неизвестная ошибка"' <<< "$primary_result" 2>/dev/null)
+  echo -e "${RED}✗ Основной VPN-профиль не создан: ${primary_error}${NC}" >&2
+  exit 1
+fi
+primary_profile=$(jq -r '.profile' <<< "$primary_result")
+echo -e "${GREEN}✓ Профиль ${primary_profile}: VLESS + REALITY + Vision на 443/tcp${NC}\n"
+
+echo -e "${BLUE}Запуск подписки через self-steal HTTPS на 443...${NC}"
+subscription_result=$(/usr/local/bin/xrayebator subscription-selfsteal-setup)
+if [[ "$(jq -r '.ok // false' <<< "$subscription_result" 2>/dev/null)" != "true" ]]; then
+  subscription_error=$(jq -r '.error // "неизвестная ошибка"' <<< "$subscription_result" 2>/dev/null)
+  echo -e "${RED}✗ Подписка не настроена: ${subscription_error}${NC}" >&2
+  exit 1
+fi
+subscription_url=$(jq -r '.subscription_url' <<< "$subscription_result")
+
 # Финальное сообщение
 clear
 echo -e "${GREEN}"
@@ -1257,13 +1294,15 @@ echo -e "${CYAN}Для управления профилями использу�
 echo -e "${YELLOW}╭──────────────────────────╮${NC}"
 echo -e "${YELLOW}│ ${GREEN}sudo xrayebator${YELLOW}          │${NC}"
 echo -e "${YELLOW}╰──────────────────────────╯${NC}\n"
+echo -e "${BLUE}Ссылка подписки:${NC}"
+echo -e "  ${GREEN}${subscription_url}${NC}\n"
 echo -e "${BLUE}Дополнительные команды:${NC}"
 echo -e "  ${CYAN}sudo xrayebator-update${NC}    - обновить Xrayebator"
 echo -e "  ${CYAN}sudo xrayebator-uninstall${NC} - удалить Xrayebator"
 echo ""
 echo -e "${BLUE}Открытые порты в firewall:${NC}"
-echo -e "  ${GREEN}443/tcp${NC}  - HTTPS (основной)"
-echo -e "  ${GREEN}8443/tcp${NC} - Альтернативный порт"
+echo -e "  ${GREEN}80/tcp${NC}  - ACME-проверка сертификата"
+echo -e "  ${GREEN}443/tcp${NC} - VPN и self-steal HTTPS"
 echo ""
 echo -e "${BLUE}GitHub:${NC} https://github.com/${GITHUB_USER}/${GITHUB_REPO}"
 echo -e "${BLUE}Версия:${NC} 3.0"
