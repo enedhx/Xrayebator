@@ -16,9 +16,9 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 # GitHub репозиторий
-GITHUB_USER="howdeploy"
+GITHUB_USER="enedhx"
 GITHUB_REPO="Xrayebator"
-GITHUB_BRANCH="main"
+GITHUB_BRANCH="codex/stealth-443"
 RAW_BASE_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${GITHUB_REPO}/${GITHUB_BRANCH}"
 
 # Пути
